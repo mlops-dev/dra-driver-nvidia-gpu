@@ -1333,10 +1333,13 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 			return nil, fmt.Errorf("MPS sharing is not supported when consumable shares is enabled")
 		}
 		if featuregates.Enabled(featuregates.DynamicMIG) {
-			// TODO: create MIG device first, get its UUID, and then enable MPS
-			// for that device -- probably based on a `PreparedDevicesList`, and
-			// not based on `AllocatableDevices`.
-			return nil, fmt.Errorf("MPS is not yet supported when using featureGates.DynamicMIG=true")
+			// MPS is allowed for full GPUs (which have UUIDs at allocation time)
+			// but not for MIG devices (whose UUIDs are only known after creation).
+			for name, device := range requestedDevices {
+				if device.IsStaticOrDynMigDevice() {
+					return nil, fmt.Errorf("MPS is not supported for MIG devices when DynamicMIG is enabled (device: %s)", name)
+				}
+			}
 		}
 		mpsc, err := config.GetMpsConfig()
 		if err != nil {

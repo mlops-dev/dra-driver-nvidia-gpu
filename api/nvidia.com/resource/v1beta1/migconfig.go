@@ -17,6 +17,8 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
@@ -59,6 +61,9 @@ func (c *MigDeviceConfig) Normalize() error {
 func (c *MigDeviceConfig) Validate() error {
 	if c.Sharing == nil {
 		return nil
+	}
+	if featuregates.Enabled(featuregates.DynamicMIG) && c.Sharing.IsMps() {
+		return fmt.Errorf("MPS sharing for MIG devices is not supported when DynamicMIG is enabled")
 	}
 	return c.Sharing.Validate()
 }

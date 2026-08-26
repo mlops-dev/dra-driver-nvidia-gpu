@@ -263,9 +263,8 @@ func ValidateFeatureGates() error {
 		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", DynamicMIG, NVMLDeviceHealthCheck)
 	}
 
-	if Enabled(DynamicMIG) && Enabled(MPSSupport) {
-		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", DynamicMIG, MPSSupport)
-	}
+	// DynamicMIG and MPSSupport can coexist: MPS is allowed for full GPUs
+	// but rejected at runtime for MIG devices (see applySharingConfig).
 
 	if Enabled(PassthroughSupport) && Enabled(NVMLDeviceHealthCheck) {
 		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", PassthroughSupport, NVMLDeviceHealthCheck)
