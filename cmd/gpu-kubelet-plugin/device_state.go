@@ -1168,9 +1168,30 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 
 		// Stop any MPS control daemons started for each group of prepared devices.
 		if featuregates.Enabled(featuregates.MPSSupport) {
-			mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(claimUID, group)
-			if err := mpsControlDaemon.Stop(ctx); err != nil {
-				return fmt.Errorf("error stopping MPS control daemon: %w", err)
+			// Under consumable shares the MPS daemon is shared across all claims
+			// on the same GPU (keyed by SharedMpsDaemonKey rather than the claim
+			// UID). Only stop it once no other completed claim still references
+			// any of this group's GPUs; otherwise stopping would tear down the
+			// daemon (and reset compute mode to DEFAULT) out from under the
+			// surviving claims.
+			daemonKey := claimUID
+			stop := true
+			if isConsumableSharesEnabled(s.config) {
+				daemonKey = SharedMpsDaemonKey
+				for _, gpuUUID := range group.Devices.GpuUUIDs() {
+					if isGpuUUIDInUseByOtherClaims(checkpoint, claimUID, gpuUUID) {
+						stop = false
+						break
+					}
+				}
+			}
+			if stop {
+				mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(daemonKey, group)
+				if err := mpsControlDaemon.Stop(ctx); err != nil {
+					return fmt.Errorf("error stopping MPS control daemon: %w", err)
+				}
+			} else {
+				klog.V(4).Infof("Unprepare: shared MPS control daemon still in use by other claims for GPUs %v, keeping it", group.Devices.GpuUUIDs())
 			}
 		}
 		// Reset when time-slicing was applied at prepare (true), or when the
@@ -1329,9 +1350,6 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 
 	// Apply MPS settings (if available and feature gate enabled).
 	if featuregates.Enabled(featuregates.MPSSupport) && config.IsMps() {
-		if isConsumableSharesEnabled(s.config) {
-			return nil, fmt.Errorf("MPS sharing is not supported when consumable shares is enabled")
-		}
 		if featuregates.Enabled(featuregates.DynamicMIG) {
 			// MPS is allowed for full GPUs (which have UUIDs at allocation time)
 			// but not for MIG devices (whose UUIDs are only known after creation).
@@ -1345,7 +1363,24 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 		if err != nil {
 			return nil, fmt.Errorf("error getting MPS configuration: %w", err)
 		}
-		mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(string(claim.UID), requestedDevices)
+		// Under consumable shares, multiple ResourceClaims may share the same
+		// physical GPU. Deriving the MPS control daemon ID from the claim UID
+		// would spawn one daemon per claim on the same GPU, which conflicts with
+		// MPS's "one control daemon per pipe directory" model. Instead, use a
+		// shared key so the daemon identity depends only on the device UUID set,
+		// and all co-located claims converge on a single shared MPS daemon.
+		// Start() is idempotent (it returns early if the daemon already exists),
+		// so the second and later claims reuse the daemon created by the first.
+		//
+		// Note: because the shared daemon is created once with the first claim's
+		// MpsConfig, co-located claims must carry an identical MpsConfig. This is
+		// already enforced by validateNoOverlappingPreparedDevices, which rejects
+		// overlapping claims whose normalized configs differ.
+		daemonKey := string(claim.UID)
+		if isConsumableSharesEnabled(s.config) {
+			daemonKey = SharedMpsDaemonKey
+		}
+		mpsControlDaemon := s.mpsManager.NewMpsControlDaemon(daemonKey, requestedDevices)
 		if err := mpsControlDaemon.Start(ctx, mpsc); err != nil {
 			return nil, fmt.Errorf("error starting MPS control daemon: %w", err)
 		}

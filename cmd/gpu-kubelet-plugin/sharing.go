@@ -56,6 +56,12 @@ const (
 	MpsControlDaemonNameFmt      = "mps-control-daemon-%v" // Fill with ClaimUID
 	MpsDefaultShmMountPath       = "/dev/shm"
 
+	// SharedMpsDaemonKey is used in place of a claim UID when deriving the MPS
+	// control daemon ID under consumable shares. It makes the daemon identity
+	// depend only on the device UUID set, so that multiple ResourceClaims
+	// sharing the same GPU converge on a single shared MPS control daemon.
+	SharedMpsDaemonKey = "shared"
+
 	// driverRootMountDir is the directory where the driver root is mounted inside the kubelet plugin container.
 	driverRootMountDir = "/driver-root"
 )

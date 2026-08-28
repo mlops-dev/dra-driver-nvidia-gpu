@@ -116,4 +116,29 @@ func applyConsumableShares(dev *resourceapi.Device, config *Config) {
 			}
 		}
 	}
+
+	// A multi-allocatable device advertises several capacities besides memory
+	// (copyEngines, multiprocessors, decoders, ...). Kubernetes consumes any
+	// capacity that lacks a requestPolicy in FULL for the first claim, which
+	// would leave nothing for a second claim and block co-allocation entirely.
+	// Give every remaining capacity a zero-default requestPolicy so that, by
+	// default, a claim consumes none of it and multiple claims can co-locate on
+	// the same device. Memory (and shares, in integer mode) keep the explicit
+	// policies set above. Workloads that need a specific slice of one of these
+	// capacities can still request it explicitly.
+	zeroQty := resource.MustParse("0")
+	for name, capacity := range dev.Capacity {
+		if capacity.RequestPolicy != nil {
+			continue
+		}
+		maxVal := capacity.Value.DeepCopy()
+		capacity.RequestPolicy = &resourceapi.CapacityRequestPolicy{
+			Default: new(zeroQty.DeepCopy()),
+			ValidRange: &resourceapi.CapacityRequestPolicyRange{
+				Min: new(zeroQty.DeepCopy()),
+				Max: new(maxVal),
+			},
+		}
+		dev.Capacity[name] = capacity
+	}
 }
