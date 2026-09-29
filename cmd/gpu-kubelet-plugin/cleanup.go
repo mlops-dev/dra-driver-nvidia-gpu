@@ -127,6 +127,12 @@ func (m *CheckpointCleanupManager) cleanup(ctx context.Context) {
 	for cpuid, cpclaim := range filtered {
 		m.unprepareIfStale(ctx, cpuid, cpclaim)
 	}
+
+	// Recover GPUs stuck in EXCLUSIVE_PROCESS after a crash/reboot prevented MPS
+	// teardown from resetting compute mode. Runs on the same startup+periodic
+	// cadence as the stale-claim cleanup above: startup handles pre-existing
+	// orphans, the periodic pass catches ones created while running.
+	m.devicestate.reconcileOrphanedComputeModes(ctx)
 }
 
 // Detect if claim is stale (not known to the API server). Call unprepare() if

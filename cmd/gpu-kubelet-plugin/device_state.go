@@ -1372,10 +1372,12 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 		// Start() is idempotent (it returns early if the daemon already exists),
 		// so the second and later claims reuse the daemon created by the first.
 		//
-		// Note: because the shared daemon is created once with the first claim's
-		// MpsConfig, co-located claims must carry an identical MpsConfig. This is
-		// already enforced by validateNoOverlappingPreparedDevices, which rejects
-		// overlapping claims whose normalized configs differ.
+		// Note: the shared daemon is created once, with the first claim's config,
+		// and its identity is a hash of the covered GPU set. Co-located claims
+		// therefore must carry an identical config AND cover an identical GPU
+		// set, otherwise they would derive different daemon ids and run separate
+		// daemons on the same GPU. validateNoOverlappingPreparedDevices enforces
+		// both for overlapping MPS claims.
 		daemonKey := string(claim.UID)
 		if isConsumableSharesEnabled(s.config) {
 			daemonKey = SharedMpsDaemonKey
@@ -1693,6 +1695,26 @@ func (s *DeviceState) validateNoOverlappingPreparedDevices(checkpoint *Checkpoin
 						if !reflect.DeepEqual(existingConfig, incomingConfig) {
 							return fmt.Errorf("requested device %s has conflicting configuration with already prepared claim %s", device, existingClaimUID)
 						}
+						// For MPS, co-located claims are served by one shared
+						// control daemon whose identity is a hash of the exact
+						// GPU set its config group covers. Equal config is not
+						// enough: the two claims must cover an identical GPU set,
+						// otherwise they derive different daemon ids and end up
+						// with two MPS daemons on the same physical GPU (which
+						// also breaks teardown, leaving GPUs in EXCLUSIVE_PROCESS).
+						if configIsMps(incomingConfig) {
+							incomingSet, incomingIsMps, err := s.mpsDeviceGroupFor(claim.Status.Allocation, device)
+							if err != nil {
+								return fmt.Errorf("error resolving MPS device group for incoming claim %s on device %s: %w", claimUID, device, err)
+							}
+							existingSet, existingIsMps, err := s.mpsDeviceGroupFor(pc.Status.Allocation, device)
+							if err != nil {
+								return fmt.Errorf("error resolving MPS device group for existing prepared claim %s on device %s: %w", existingClaimUID, device, err)
+							}
+							if incomingIsMps && existingIsMps && !reflect.DeepEqual(incomingSet, existingSet) {
+								return fmt.Errorf("MPS claim %s shares device %s with prepared claim %s but requests a different GPU set; co-located MPS claims must request an identical GPU set", claimUID, device, existingClaimUID)
+							}
+						}
 						continue
 					}
 				}
@@ -1721,6 +1743,53 @@ func (s *DeviceState) getNormalizedDeviceConfig(allocation *resourceapi.Allocati
 	}
 
 	return nil, nil
+}
+
+// mpsDeviceGroupFor returns the set of full-GPU device names covered by the MPS
+// config group that deviceName belongs to. The MPS control daemon manages all
+// GPUs in a config group as a single unit: it sets EXCLUSIVE_PROCESS on the
+// whole set, exposes the whole set via CUDA_VISIBLE_DEVICES, and owns one pipe
+// directory. Under consumable shares the daemon identity is a hash of exactly
+// this set, so two claims can only converge on one shared daemon if their MPS
+// groups cover an identical GPU set. Returns (nil, false) when deviceName is
+// not part of an MPS config group.
+func (s *DeviceState) mpsDeviceGroupFor(allocation *resourceapi.AllocationResult, deviceName string) (map[string]struct{}, bool, error) {
+	configResultsMap, err := s.getConfigResultsMap(allocation)
+	if err != nil {
+		return nil, false, err
+	}
+
+	for configObj, results := range configResultsMap {
+		inGroup := false
+		for _, res := range results {
+			if res.Device == deviceName {
+				inGroup = true
+				break
+			}
+		}
+		if !inGroup {
+			continue
+		}
+		config, err := normalizeAndValidateConfig(configObj)
+		if err != nil {
+			return nil, false, err
+		}
+		if !configIsMps(config) {
+			return nil, false, nil
+		}
+		gpuSet := make(map[string]struct{})
+		for _, res := range results {
+			dev := s.perGPUAllocatable.GetAllocatableDevice(res.Device)
+			// Only full GPUs carry a UUID at allocation time and are hashed into
+			// the daemon identity; skip anything that is not a full GPU.
+			if dev != nil && dev.Type() == GpuDeviceType {
+				gpuSet[res.Device] = struct{}{}
+			}
+		}
+		return gpuSet, true, nil
+	}
+
+	return nil, false, nil
 }
 
 func (s *DeviceState) getConfigResultsMap(allocation *resourceapi.AllocationResult) (map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult, error) {
@@ -1845,6 +1914,120 @@ func normalizeAndValidateConfig(c runtime.Object) (configapi.Interface, error) {
 		return nil, fmt.Errorf("error validating config: %w", err)
 	}
 	return config, nil
+}
+
+// configIsMps reports whether a device config carries an MPS sharing strategy.
+// The MPS predicate lives on the Sharing sub-object (GpuConfig/MigDeviceConfig),
+// not on the top-level Interface, so the concrete type must be inspected.
+func configIsMps(config configapi.Interface) bool {
+	switch c := config.(type) {
+	case *configapi.GpuConfig:
+		return c.Sharing != nil && c.Sharing.IsMps()
+	case *configapi.MigDeviceConfig:
+		return c.Sharing != nil && c.Sharing.IsMps()
+	default:
+		return false
+	}
+}
+
+// gpusUnderLiveMpsDaemons returns the full-GPU UUIDs that a live MPS control
+// daemon still holds in EXCLUSIVE_PROCESS. A GPU qualifies when it belongs to a
+// PrepareCompleted claim's device group whose ConfigState carries an
+// MpsControlDaemonID (i.e., MPS was started for that group). MpsControlDaemonID
+// is persisted in the checkpoint, so this set survives a plugin restart.
+func gpusUnderLiveMpsDaemons(checkpoint *Checkpoint) map[string]struct{} {
+	live := make(map[string]struct{})
+	if checkpoint == nil || checkpoint.V2 == nil {
+		return live
+	}
+	for _, claim := range checkpoint.V2.PreparedClaims {
+		if claim.CheckpointState != ClaimCheckpointStatePrepareCompleted {
+			continue
+		}
+		for _, group := range claim.PreparedDevices {
+			if group.ConfigState.MpsControlDaemonID == "" {
+				continue
+			}
+			for _, uuid := range group.GpuUUIDs() {
+				live[uuid] = struct{}{}
+			}
+		}
+	}
+	return live
+}
+
+// reconcileOrphanedComputeModes resets a managed GPU back to DEFAULT when it is
+// stuck in EXCLUSIVE_PROCESS but no live MPS control daemon owns it. This
+// recovers GPUs left behind when a crash or reboot prevented MPS teardown
+// (which resets compute mode) from running; otherwise such a GPU stays in
+// EXCLUSIVE_PROCESS and rejects non-MPS workloads.
+//
+// Kept conservative on purpose: it only touches GPUs this driver advertises,
+// and only those not in gpusUnderLiveMpsDaemons(). A GPU another actor set to
+// EXCLUSIVE_PROCESS is only reset if no live checkpointed MPS claim references
+// it. Best-effort and idempotent: a GPU already in DEFAULT is skipped, and a
+// per-GPU failure is logged without aborting the rest.
+func (s *DeviceState) reconcileOrphanedComputeModes(ctx context.Context) {
+	if !featuregates.Enabled(featuregates.MPSSupport) {
+		return
+	}
+
+	// Hold the DeviceState lock across the whole reconcile. Prepare()/Unprepare()
+	// take this same lock, so this serializes against a concurrent Prepare that
+	// is setting EXCLUSIVE_PROCESS and recording the MPS daemon in the
+	// checkpoint. Without it, reconcile could read the checkpoint before that
+	// write, observe the freshly-set EXCLUSIVE_PROCESS, and wrongly reset a GPU
+	// out from under a live MPS workload.
+	s.Lock()
+	defer s.Unlock()
+
+	checkpoint, err := s.getCheckpoint(ctx)
+	if err != nil {
+		klog.Errorf("MPS reconcile: unable to get checkpoint, skipping: %s", err)
+		return
+	}
+
+	// GPUs this driver advertises (full GPUs only; MIG/VFIO carry no compute
+	// mode we manage here).
+	var managed []string
+	for _, dev := range s.perGPUAllocatable.GetAllDevices() {
+		if dev.Type() == GpuDeviceType {
+			managed = append(managed, dev.UUID())
+		}
+	}
+	if len(managed) == 0 {
+		return
+	}
+
+	modes, err := s.nvdevlib.getComputeModes(managed)
+	if err != nil {
+		klog.Errorf("MPS reconcile: unable to read compute modes, skipping: %s", err)
+		return
+	}
+
+	live := gpusUnderLiveMpsDaemons(checkpoint)
+
+	var orphaned []string
+	for uuid, mode := range modes {
+		if mode != nvml.COMPUTEMODE_EXCLUSIVE_PROCESS {
+			continue
+		}
+		if _, ok := live[uuid]; ok {
+			continue
+		}
+		orphaned = append(orphaned, uuid)
+	}
+	if len(orphaned) == 0 {
+		return
+	}
+
+	klog.Warningf("MPS reconcile: resetting %d orphaned GPU(s) from EXCLUSIVE_PROCESS to DEFAULT (no live MPS daemon owns them): %v", len(orphaned), orphaned)
+	for _, uuid := range orphaned {
+		// Reset one at a time so a single failure does not abort the batch.
+		if err := s.nvdevlib.setComputeMode([]string{uuid}, "DEFAULT"); err != nil {
+			klog.Errorf("MPS reconcile: failed to reset compute mode for %s (will retry on next reconcile): %s", uuid, err)
+		}
+	}
 }
 
 func (s *DeviceState) getPreparedMigDevice(checkpoint *Checkpoint, deviceName string) *PreparedMigDevice {

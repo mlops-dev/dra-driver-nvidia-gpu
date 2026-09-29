@@ -912,6 +912,36 @@ func (l deviceLib) setComputeMode(uuids []string, mode string) error {
 	return nil
 }
 
+// getComputeModes reads the current NVML compute mode for each full-GPU UUID.
+// Read via NVML (rather than the nvidia-smi exec used by setComputeMode) so the
+// caller gets a typed value without parsing CLI output. A UUID that cannot be
+// resolved to a device handle is omitted from the result rather than failing
+// the whole batch, so a single missing GPU does not block reconciliation of the
+// others.
+func (l deviceLib) getComputeModes(uuids []string) (map[string]nvml.ComputeMode, error) {
+	shutdown, ret := l.ensureNVML()
+	if ret != nvml.SUCCESS {
+		return nil, fmt.Errorf("error initializing NVML: %w", ret)
+	}
+	defer shutdown()
+
+	modes := make(map[string]nvml.ComputeMode, len(uuids))
+	for _, uuid := range uuids {
+		dev, ret := l.DeviceGetHandleByUUID(uuid)
+		if ret != nvml.SUCCESS {
+			klog.Warningf("getComputeModes: cannot get device handle for %s: %v", uuid, ret)
+			continue
+		}
+		mode, ret := dev.GetComputeMode()
+		if ret != nvml.SUCCESS {
+			klog.Warningf("getComputeModes: cannot read compute mode for %s: %v", uuid, ret)
+			continue
+		}
+		modes[uuid] = mode
+	}
+	return modes, nil
+}
+
 // Get an NVML device handle for a physical GPU. When not in DynamicMIG mode,
 // this currently always calls out to NVML's DeviceGetHandleByUUID(). In
 // DynamicMIG mode, this function maintains an NVML handle cache and hence

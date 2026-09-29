@@ -18,11 +18,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 
 	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
@@ -227,7 +229,7 @@ func TestGetAllocatableDevicesForClaim(t *testing.T) {
 	}
 }
 
-func TestApplySharingConfigMpsDisallowedWithConsumableShares(t *testing.T) {
+func TestApplySharingConfigMpsWithConsumableShares(t *testing.T) {
 	perGPU := &PerGPUAllocatableDevices{
 		allocatablesMap: map[PCIBusID]AllocatableDevices{
 			"0000:00:00.0": {
@@ -251,24 +253,40 @@ func TestApplySharingConfigMpsDisallowedWithConsumableShares(t *testing.T) {
 		{Request: "req-1", Device: "gpu-1"},
 	}
 
-	t.Run("disallowed when consumable shares enabled", func(t *testing.T) {
+	t.Run("no longer rejected when consumable shares enabled", func(t *testing.T) {
+		// MPS + consumable shares now coexist (served by a shared MPS daemon),
+		// so applySharingConfig must not fail with the old mutual-exclusion
+		// error. It still proceeds to start the daemon, which fails on the nil
+		// clientset here; that failure is fine as long as it is not the old
+		// "not supported" rejection.
 		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
 			string(featuregates.MPSSupport):       true,
 			string(featuregates.ConsumableShares): true,
 		}))
 
-		state := &DeviceState{
-			config: &Config{
-				flags: &Flags{
-					consumableShares: "unlimited",
-				},
+		cfg := &Config{
+			flags: &Flags{
+				nodeName:         "node-a",
+				namespace:        "default",
+				consumableShares: "unlimited",
 			},
+		}
+		state := &DeviceState{
+			config:            cfg,
+			mpsManager:        NewMpsManager(cfg, nil, "/", "/templates/mps-control-daemon.tmpl.yaml"),
 			perGPUAllocatable: perGPU,
 		}
 
+		defer func() {
+			// Start() may panic on the nil clientset; that still proves the
+			// consumable-shares rejection was not hit.
+			_ = recover()
+		}()
+
 		_, err := state.applySharingConfig(context.Background(), config, claim, results, nil)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "MPS sharing is not supported when consumable shares is enabled")
+		if err != nil {
+			require.NotContains(t, err.Error(), "MPS sharing is not supported when consumable shares is enabled")
+		}
 	})
 
 	t.Run("allowed when consumable shares disabled", func(t *testing.T) {
@@ -402,6 +420,176 @@ func TestSharingReferenceCountingHelpers(t *testing.T) {
 	var cpNil *Checkpoint
 	require.False(t, isGpuUUIDInUseByOtherClaims(cpNil, "claim-1", "GPU-1111"))
 	require.False(t, isMigDeviceInUseByOtherClaims(cpNil, "claim-1", "MIG-2222", "mig-0"))
+}
+
+// gpuGroupWithDaemon builds a PreparedDeviceGroup holding the given full-GPU
+// UUIDs, tagging it with an MPS daemon id only when mpsDaemonID is non-empty
+// (mirroring how applySharingConfig records MpsControlDaemonID for MPS groups).
+func gpuGroupWithDaemon(mpsDaemonID string, uuids ...string) *PreparedDeviceGroup {
+	var devices PreparedDeviceList
+	for _, uuid := range uuids {
+		devices = append(devices, PreparedDevice{
+			Gpu: &PreparedGpu{
+				Info:   &GpuInfo{UUID: uuid},
+				Device: &CheckpointedDevice{DeviceName: uuid},
+			},
+		})
+	}
+	return &PreparedDeviceGroup{
+		Devices:     devices,
+		ConfigState: DeviceConfigState{MpsControlDaemonID: mpsDaemonID},
+	}
+}
+
+func TestGpusUnderLiveMpsDaemons(t *testing.T) {
+	checkpoint := &Checkpoint{
+		V2: &CheckpointV2{
+			PreparedClaims: PreparedClaimsByUID{
+				// MPS daemon spanning two GPUs: both are legitimately EXCLUSIVE_PROCESS.
+				"claim-mps-multi": {
+					CheckpointState: ClaimCheckpointStatePrepareCompleted,
+					PreparedDevices: PreparedDevices{
+						gpuGroupWithDaemon("shared-abcde", "GPU-MPS-A", "GPU-MPS-B"),
+					},
+				},
+				// One claim with both an MPS group and a non-MPS group: only the
+				// MPS group's GPU counts as held by a daemon.
+				"claim-mixed": {
+					CheckpointState: ClaimCheckpointStatePrepareCompleted,
+					PreparedDevices: PreparedDevices{
+						gpuGroupWithDaemon("shared-11111", "GPU-MPS-C"),
+						gpuGroupWithDaemon("", "GPU-PLAIN"),
+					},
+				},
+				// Not yet completed: ignored even though it carries a daemon id.
+				"claim-pending": {
+					CheckpointState: ClaimCheckpointStatePrepareStarted,
+					PreparedDevices: PreparedDevices{
+						gpuGroupWithDaemon("shared-fffff", "GPU-PENDING"),
+					},
+				},
+			},
+		},
+	}
+
+	live := gpusUnderLiveMpsDaemons(checkpoint)
+
+	require.Contains(t, live, "GPU-MPS-A") // both GPUs of a multi-GPU MPS daemon
+	require.Contains(t, live, "GPU-MPS-B")
+	require.Contains(t, live, "GPU-MPS-C")      // MPS group of the mixed claim
+	require.NotContains(t, live, "GPU-PLAIN")   // non-MPS group of the mixed claim
+	require.NotContains(t, live, "GPU-PENDING") // claim not PrepareCompleted
+	require.Len(t, live, 3)
+
+	// nil and empty checkpoints yield an empty (non-nil) set.
+	require.Empty(t, gpusUnderLiveMpsDaemons(nil))
+	require.Empty(t, gpusUnderLiveMpsDaemons(&Checkpoint{}))
+}
+
+// mpsGpuConfigJSON encodes a GpuConfig with the MPS sharing strategy as the raw
+// opaque parameters the driver decodes from a claim's allocation config.
+func mpsGpuConfigJSON(t *testing.T) []byte {
+	t.Helper()
+	raw, err := json.Marshal(configapi.GpuConfig{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: configapi.GroupName + "/" + configapi.Version,
+			Kind:       configapi.GpuConfigKind,
+		},
+		Sharing: &configapi.GpuSharing{
+			Strategy:  configapi.MpsStrategy,
+			MpsConfig: &configapi.MpsConfig{},
+		},
+	})
+	require.NoError(t, err)
+	return raw
+}
+
+// TestValidateNoOverlappingMpsDeviceSet covers the core invariant of the
+// consumable+MPS fix: two co-located MPS claims that share a GPU must request an
+// identical GPU set, otherwise they derive different shared-daemon ids and end
+// up running separate MPS daemons on the same physical GPU.
+func TestValidateNoOverlappingMpsDeviceSet(t *testing.T) {
+	require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
+		string(featuregates.MPSSupport):       true,
+		string(featuregates.ConsumableShares): true,
+	}))
+
+	perGPU := &PerGPUAllocatableDevices{
+		allocatablesMap: map[PCIBusID]AllocatableDevices{
+			"0000:00:00.0": {"gpu-0": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0000"}}},
+			"0000:00:01.0": {"gpu-1": &AllocatableDevice{Gpu: &GpuInfo{UUID: "GPU-0001"}}},
+		},
+	}
+	state := &DeviceState{
+		config:            &Config{flags: &Flags{consumableShares: "unlimited"}},
+		perGPUAllocatable: perGPU,
+	}
+
+	mpsConfig := []resourceapi.DeviceAllocationConfiguration{{
+		Source: resourceapi.AllocationConfigSourceClaim,
+		DeviceConfiguration: resourceapi.DeviceConfiguration{
+			Opaque: &resourceapi.OpaqueDeviceConfiguration{
+				Driver:     DriverName,
+				Parameters: runtime.RawExtension{Raw: mpsGpuConfigJSON(t)},
+			},
+		},
+	}}
+
+	// allocation builds a claim/prepared-claim allocation over the given GPU device names.
+	allocation := func(devices ...string) *resourceapi.AllocationResult {
+		var results []resourceapi.DeviceRequestAllocationResult
+		for _, d := range devices {
+			results = append(results, resourceapi.DeviceRequestAllocationResult{
+				Driver: DriverName, Request: "gpu", Device: d,
+			})
+		}
+		return &resourceapi.AllocationResult{
+			Devices: resourceapi.DeviceAllocationResult{Results: results, Config: mpsConfig},
+		}
+	}
+
+	// Existing prepared claim: MPS on {gpu-0}.
+	checkpoint := &Checkpoint{
+		V2: &CheckpointV2{
+			PreparedClaims: PreparedClaimsByUID{
+				"claim-existing": {
+					CheckpointState: ClaimCheckpointStatePrepareCompleted,
+					Status:          resourceapi.ResourceClaimStatus{Allocation: allocation("gpu-0")},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		devices []string
+		wantErr bool
+	}{
+		// Shares gpu-0 with the existing claim and requests the same set: the
+		// two converge on one shared daemon, so co-location is allowed.
+		{name: "identical GPU set co-locates", devices: []string{"gpu-0"}, wantErr: false},
+		// Shares gpu-0 but also requests gpu-1: a different set, so the daemon
+		// ids would diverge. Must be rejected.
+		{name: "different GPU set rejected", devices: []string{"gpu-0", "gpu-1"}, wantErr: true},
+		// No overlap with the existing claim (only gpu-1): the MPS set check
+		// does not apply, so this is allowed even though the sets differ.
+		{name: "no overlap allowed", devices: []string{"gpu-1"}, wantErr: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			incoming := &resourceapi.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{UID: "claim-incoming"},
+				Status:     resourceapi.ResourceClaimStatus{Allocation: allocation(tc.devices...)},
+			}
+			err := state.validateNoOverlappingPreparedDevices(checkpoint, incoming)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "different GPU set")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 type testFMClient struct {
