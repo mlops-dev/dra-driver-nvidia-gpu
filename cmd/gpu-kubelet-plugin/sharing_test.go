@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -90,4 +91,37 @@ func TestRenderMpsControlDaemonDeploymentImagePullSettings(t *testing.T) {
 	}, deployment.Spec.Template.Spec.ImagePullSecrets)
 	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
 	require.Equal(t, corev1.PullAlways, deployment.Spec.Template.Spec.Containers[0].ImagePullPolicy)
+}
+
+func TestMpsDeploymentGpuUUIDs(t *testing.T) {
+	// deployment builds a Deployment whose sole container carries the given
+	// CUDA_VISIBLE_DEVICES value (envValue), plus an unrelated env var to make
+	// sure lookup is by name, not position.
+	deployment := func(envValue string, withEnv bool) *appsv1.Deployment {
+		var env []corev1.EnvVar
+		env = append(env, corev1.EnvVar{Name: "FEATURE_GATES", Value: "x=y"})
+		if withEnv {
+			env = append(env, corev1.EnvVar{Name: "CUDA_VISIBLE_DEVICES", Value: envValue})
+		}
+		d := &appsv1.Deployment{}
+		d.Spec.Template.Spec.Containers = []corev1.Container{{Name: "mps-control-daemon", Env: env}}
+		return d
+	}
+
+	tests := []struct {
+		name string
+		dep  *appsv1.Deployment
+		want []string
+	}{
+		{name: "single GPU", dep: deployment("GPU-0000", true), want: []string{"GPU-0000"}},
+		{name: "multiple GPUs", dep: deployment("GPU-0000,GPU-1111", true), want: []string{"GPU-0000", "GPU-1111"}},
+		{name: "env absent", dep: deployment("", false), want: nil},
+		{name: "env empty", dep: deployment("", true), want: nil},
+		{name: "no containers", dep: &appsv1.Deployment{}, want: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, mpsDeploymentGpuUUIDs(tc.dep))
+		})
+	}
 }

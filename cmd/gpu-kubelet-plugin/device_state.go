@@ -2021,13 +2021,21 @@ func (s *DeviceState) reconcileOrphanedComputeModes(ctx context.Context) {
 		return
 	}
 
-	klog.Warningf("MPS reconcile: resetting %d orphaned GPU(s) from EXCLUSIVE_PROCESS to DEFAULT (no live MPS daemon owns them): %v", len(orphaned), orphaned)
-	for _, uuid := range orphaned {
-		// Reset one at a time so a single failure does not abort the batch.
-		if err := s.nvdevlib.setComputeMode([]string{uuid}, "DEFAULT"); err != nil {
-			klog.Errorf("MPS reconcile: failed to reset compute mode for %s (will retry on next reconcile): %s", uuid, err)
+	if len(orphaned) > 0 {
+		klog.Warningf("MPS reconcile: resetting %d orphaned GPU(s) from EXCLUSIVE_PROCESS to DEFAULT (no live MPS daemon owns them): %v", len(orphaned), orphaned)
+		for _, uuid := range orphaned {
+			// Reset one at a time so a single failure does not abort the batch.
+			if err := s.nvdevlib.setComputeMode([]string{uuid}, "DEFAULT"); err != nil {
+				klog.Errorf("MPS reconcile: failed to reset compute mode for %s (will retry on next reconcile): %s", uuid, err)
+			}
 		}
 	}
+
+	// Resetting the compute mode above frees non-MPS workloads, but the orphaned
+	// MPS control daemon Deployment (and its on-host files) would otherwise stay
+	// around. Tear those down too, guarding against removing a daemon that still
+	// serves a live claim via the same live set used above.
+	s.mpsManager.DeleteOrphanedControlDaemons(ctx, live)
 }
 
 func (s *DeviceState) getPreparedMigDevice(checkpoint *Checkpoint, deviceName string) *PreparedMigDevice {

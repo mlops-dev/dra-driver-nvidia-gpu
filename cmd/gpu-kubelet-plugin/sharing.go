@@ -456,22 +456,110 @@ func (m *MpsControlDaemon) Stop(ctx context.Context) error {
 		return fmt.Errorf("error resetting compute mode to DEFAULT: %w", err)
 	}
 
+	return cleanupMpsControlFiles(m.shmDir, m.rootDir)
+}
+
+// cleanupMpsControlFiles unmounts the MPS shm tmpfs and removes the daemon's
+// on-host control-files directory. Shared by normal teardown (Stop) and orphan
+// reconciliation, so both leave the same on-host state behind.
+func cleanupMpsControlFiles(shmDir, rootDir string) error {
 	mountExecutable, err := exec.LookPath("mount")
 	if err != nil {
 		return fmt.Errorf("error finding 'mount' executable: %w", err)
 	}
 
 	mounter := mount.New(mountExecutable)
-	err = mount.CleanupMountPoint(m.shmDir, mounter, true)
-	if err != nil {
-		return fmt.Errorf("error unmounting %v: %w", m.shmDir, err)
+	if err := mount.CleanupMountPoint(shmDir, mounter, true); err != nil {
+		return fmt.Errorf("error unmounting %v: %w", shmDir, err)
 	}
 
-	err = os.RemoveAll(m.rootDir)
-	if err != nil {
-		return fmt.Errorf("error removing directory %v: %w", m.rootDir, err)
+	if err := os.RemoveAll(rootDir); err != nil {
+		return fmt.Errorf("error removing directory %v: %w", rootDir, err)
 	}
 
+	return nil
+}
+
+// DeleteOrphanedControlDaemons removes MPS control daemon Deployments on this
+// node that no live claim owns. A crash or reboot can leave a daemon running
+// after its claim is gone; resetting only the GPU compute mode (as the reconcile
+// does) would leave that Deployment and its on-host files behind. liveGPUs is
+// the set of GPU UUIDs still legitimately held by MPS (from the checkpoint).
+//
+// Conservative by design: a Deployment is deleted only when none of the GPUs it
+// covers is in liveGPUs, so a daemon still serving a live claim is never torn
+// down. Best-effort; per-Deployment failures are logged and do not abort the
+// rest. Scoped to this node via the Deployment's nodeName.
+func (m *MpsManager) DeleteOrphanedControlDaemons(ctx context.Context, liveGPUs map[string]struct{}) {
+	nodeName := m.config.flags.nodeName
+	namespace := m.config.flags.namespace
+
+	deployments, err := m.config.clientsets.Core.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Errorf("MPS reconcile: unable to list deployments, skipping orphan daemon cleanup: %s", err)
+		return
+	}
+
+	daemonPrefix := fmt.Sprintf(MpsControlDaemonNameFmt, "")
+	for i := range deployments.Items {
+		d := &deployments.Items[i]
+		if !strings.HasPrefix(d.Name, daemonPrefix) {
+			continue
+		}
+		// Only touch daemons pinned to this node; another node's plugin owns its own.
+		if d.Spec.Template.Spec.NodeName != nodeName {
+			continue
+		}
+
+		covered := mpsDeploymentGpuUUIDs(d)
+		if len(covered) == 0 {
+			continue
+		}
+		stillInUse := false
+		for _, uuid := range covered {
+			if _, ok := liveGPUs[uuid]; ok {
+				stillInUse = true
+				break
+			}
+		}
+		if stillInUse {
+			continue
+		}
+
+		klog.Warningf("MPS reconcile: deleting orphaned MPS control daemon %q (covers GPUs %v, none in use)", d.Name, covered)
+		deletePolicy := metav1.DeletePropagationForeground
+		if err := m.config.clientsets.Core.AppsV1().Deployments(namespace).Delete(
+			ctx, d.Name, metav1.DeleteOptions{PropagationPolicy: &deletePolicy},
+		); err != nil && !errors.IsNotFound(err) {
+			klog.Errorf("MPS reconcile: failed to delete orphaned deployment %q: %s", d.Name, err)
+			continue
+		}
+
+		// The daemon id is the Deployment name minus the fixed prefix; the
+		// on-host control files live under controlFilesRoot/<id>.
+		id := strings.TrimPrefix(d.Name, daemonPrefix)
+		rootDir := fmt.Sprintf("%s/%s", m.controlFilesRoot, id)
+		shmDir := fmt.Sprintf("%s/%s", rootDir, "shm")
+		if err := cleanupMpsControlFiles(shmDir, rootDir); err != nil {
+			klog.Errorf("MPS reconcile: deleted deployment %q but failed to clean control files: %s", d.Name, err)
+		}
+	}
+}
+
+// mpsDeploymentGpuUUIDs extracts the GPU UUID set an MPS control daemon covers,
+// read from the CUDA_VISIBLE_DEVICES env the driver sets when rendering it.
+func mpsDeploymentGpuUUIDs(d *appsv1.Deployment) []string {
+	for _, c := range d.Spec.Template.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name != "CUDA_VISIBLE_DEVICES" {
+				continue
+			}
+			if e.Value == "" {
+				return nil
+			}
+			return strings.Split(e.Value, ",")
+		}
+	}
 	return nil
 }
 
