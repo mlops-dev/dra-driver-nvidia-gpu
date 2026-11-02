@@ -478,11 +478,10 @@ func TestValidateFeatureGates(t *testing.T) {
 			description:  "should fail when both DynamicMIG and NVMLDeviceHealthCheck are enabled",
 		},
 		{
-			name:         "DynamicMIG enabled with MPSSupport",
-			fgMap:        map[featuregate.Feature]bool{DynamicMIG: true, MPSSupport: true},
-			expectError:  true,
-			errorMessage: "feature gate DynamicMIG is currently mutually exclusive with MPSSupport",
-			description:  "should fail when both DynamicMIG and MPSSupport are enabled",
+			name:        "DynamicMIG enabled with MPSSupport",
+			fgMap:       map[featuregate.Feature]bool{DynamicMIG: true, MPSSupport: true},
+			expectError: false,
+			description: "should be valid: MPS is allowed for full GPUs and rejected per-device for MIG at prepare time",
 		},
 		{
 			name:        "Only DynamicMIG enabled",

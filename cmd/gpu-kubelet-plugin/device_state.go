@@ -2017,9 +2017,6 @@ func (s *DeviceState) reconcileOrphanedComputeModes(ctx context.Context) {
 		}
 		orphaned = append(orphaned, uuid)
 	}
-	if len(orphaned) == 0 {
-		return
-	}
 
 	if len(orphaned) > 0 {
 		klog.Warningf("MPS reconcile: resetting %d orphaned GPU(s) from EXCLUSIVE_PROCESS to DEFAULT (no live MPS daemon owns them): %v", len(orphaned), orphaned)
