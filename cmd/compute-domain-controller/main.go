@@ -69,25 +69,29 @@ type Flags struct {
 	maxNodesPerIMEXDomain int
 	logVerbosityCDDaemon  int
 
-	imexMode      string
-	imexIsolation string
+	imexMode            string
+	imexIsolation       string
+	imexConfigOverrides string
 
 	httpEndpoint string
 	metricsPath  string
 	profilePath  string
 
-	additionalNamespaces cli.StringSlice
-	imagePullSecretsCSV  string
-	klogVerbosity        int
+	additionalNamespaces      cli.StringSlice
+	imagePullSecretsCSV       string
+	cdDaemonPriorityClassName string
+	klogVerbosity             int
 }
 
 type Config struct {
-	driverName           string
-	flags                *Flags
-	clientsets           pkgflags.ClientSets
-	mux                  *http.ServeMux
-	imagePullSecretNames []string
-	imexConfig           imex.Config
+	driverName                string
+	flags                     *Flags
+	clientsets                pkgflags.ClientSets
+	mux                       *http.ServeMux
+	imagePullSecretNames      []string
+	imexConfig                imex.Config
+	imexConfigOverrides       map[string]string
+	cdDaemonPriorityClassName string
 }
 
 func main() {
@@ -130,6 +134,12 @@ func newApp() *cli.App {
 			Destination: &flags.imagePullSecretsCSV,
 			EnvVars:     []string{"CD_DAEMON_IMAGE_PULL_SECRET_NAMES"},
 		},
+		&cli.StringFlag{
+			Name:        "cd-daemon-priority-class-name",
+			Usage:       "PriorityClassName applied to dynamically rendered compute-domain-daemon DaemonSet pods.",
+			Destination: &flags.cdDaemonPriorityClassName,
+			EnvVars:     []string{"CD_DAEMON_PRIORITY_CLASS_NAME"},
+		},
 		&cli.IntFlag{
 			Name:        "log-verbosity-cd-daemon",
 			Usage:       "Log verbosity for dynamically launched CD daemon pods",
@@ -157,6 +167,12 @@ func newApp() *cli.App {
 			Value:       string(imex.IsolationIMEXDomain),
 			Destination: &flags.imexIsolation,
 			EnvVars:     []string{"IMEX_ISOLATION"},
+		},
+		&cli.StringFlag{
+			Name:        "imex-config-overrides",
+			Usage:       "Comma-separated KEY=VALUE overrides for arbitrary nvidia-imex daemon config file settings generated in the driverManaged mode.",
+			Destination: &flags.imexConfigOverrides,
+			EnvVars:     []string{"IMEX_CONFIG_OVERRIDES"},
 		},
 		&cli.StringFlag{
 			Category:    "HTTP server:",
@@ -225,6 +241,13 @@ func newApp() *cli.App {
 			if err := imexConfig.Validate(featuregates.Enabled(featuregates.HostManagedIMEXDaemon)); err != nil {
 				return fmt.Errorf("imex configuration validation failed: %w", err)
 			}
+			imexConfigOverrides, err := imex.ParseConfigOverrides(flags.imexConfigOverrides)
+			if err != nil {
+				return fmt.Errorf("invalid imex-config-overrides: %w", err)
+			}
+			if err := imex.ValidateConfigOverrides(imexConfigOverrides); err != nil {
+				return fmt.Errorf("invalid imex-config-overrides: %w", err)
+			}
 			if imexConfig.EffectiveHostManaged() {
 				// The driver never creates per-ComputeDomain IMEX DaemonSets or
 				// ComputeDomainClique objects in host-managed mode, so these gates
@@ -245,12 +268,14 @@ func newApp() *cli.App {
 			}
 
 			config := &Config{
-				mux:                  mux,
-				flags:                flags,
-				clientsets:           clientsets,
-				driverName:           DriverName,
-				imagePullSecretNames: strings.Fields(strings.ReplaceAll(strings.TrimSpace(flags.imagePullSecretsCSV), ",", " ")),
-				imexConfig:           imexConfig,
+				mux:                       mux,
+				flags:                     flags,
+				clientsets:                clientsets,
+				driverName:                DriverName,
+				imagePullSecretNames:      strings.Fields(strings.ReplaceAll(strings.TrimSpace(flags.imagePullSecretsCSV), ",", " ")),
+				imexConfig:                imexConfig,
+				imexConfigOverrides:       imexConfigOverrides,
+				cdDaemonPriorityClassName: flags.cdDaemonPriorityClassName,
 			}
 
 			if flags.httpEndpoint != "" {

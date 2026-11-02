@@ -200,7 +200,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		// Associated device(s) has/ave been prepared by us. Prepare() must be
 		// idempotent, as it may be invoked more than once per claim (and actual
 		// device preparation must happen at most once).
-		klog.V(4).Infof("Skip prepare: claim already in PrepareCompleted state: %s", ResourceClaimToString(claim))
+		klog.V(2).Infof("Skip prepare: claim already in PrepareCompleted state: %s", ResourceClaimToString(claim))
 		return preparedClaim.PreparedDevices.GetDevices(), nil
 	}
 	if exists && preparedClaim.CheckpointState == ClaimCheckpointStatePrepareAborted && claimMatchesPreparedClaim(preparedClaim, claim) {
@@ -667,7 +667,7 @@ func (s *DeviceState) applyComputeDomainChannelConfigHostManaged(ctx context.Con
 		ComputeDomain: config.DomainID,
 	}
 
-	if s.computeDomainManager.cliqueID == "" {
+	if s.computeDomainManager.CliqueID() == "" {
 		// Non-fabric node (e.g. not part of an MNNVL clique): do not inject
 		// IMEX channel device nodes, but let the claim succeed.
 		return &configState, nil

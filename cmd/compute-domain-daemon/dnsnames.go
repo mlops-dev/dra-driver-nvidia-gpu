@@ -17,15 +17,15 @@ limitations under the License.
 package main
 
 import (
-	"cmp"
 	"fmt"
-	"maps"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/klog/v2"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
@@ -34,29 +34,61 @@ import (
 const (
 	hostsFilePath = "/etc/hosts"
 	dnsNamePrefix = "compute-domain-daemon-"
-	dnsNameFormat = dnsNamePrefix + "%04d"
+
+	// sentinelIPAddress is used in the generated DNS name mapping for any
+	// maxNodesPerIMEXDomain slot that doesn't currently have a live daemon
+	// registered to it.
+	//
+	// Giving every slot a hosts file entry keeps resolution local: it
+	// always succeeds via the "files" NSS source before DNS is ever
+	// consulted, and connecting to a loopback address nothing listens on
+	// fails immediately (a local ECONNREFUSED, no network round-trip)
+	// which is exactly the right outcome for a slot with no daemon in it
+	// yet.
+	sentinelIPAddress = "127.0.0.2"
 )
 
-// IPToDNSNameMap holds a map of IP Addresses to DNS names.
-type IPToDNSNameMap map[string]string
+// dnsNameMapping pairs a DNS name with the address it currently resolves to
+// in /etc/hosts, either a live daemon's pod IP, or sentinelIPAddress for a
+// maxNodesPerIMEXDomain slot with no daemon registered to it yet.
+type dnsNameMapping struct {
+	dnsName string
+	ip      string
+}
 
 // DNSNameManager manages the allocation of static DNS names to IP addresses.
 type DNSNameManager struct {
 	sync.Mutex
-	ipToDNSName           IPToDNSNameMap
+	mappings              []dnsNameMapping
 	cliqueID              string
 	maxNodesPerIMEXDomain int
 	nodesConfigPath       string
+	domainHash            string
 }
 
 // NewDNSNameManager creates a new DNS name manager.
-func NewDNSNameManager(cliqueID string, maxNodesPerIMEXDomain int, nodesConfigPath string) *DNSNameManager {
+func NewDNSNameManager(cliqueID string, maxNodesPerIMEXDomain int, nodesConfigPath string, cdUID string) *DNSNameManager {
 	return &DNSNameManager{
-		ipToDNSName:           make(IPToDNSNameMap),
 		cliqueID:              cliqueID,
 		maxNodesPerIMEXDomain: maxNodesPerIMEXDomain,
 		nodesConfigPath:       nodesConfigPath,
+		domainHash:            computeDomainHash(cdUID),
 	}
+}
+
+// computeDomainHash returns a short, deterministic, DNS-label-safe hash of a
+// ComputeDomain UID, used to fold ComputeDomain identity into generated DNS
+// names without depending on the UID's own format or length.
+func computeDomainHash(cdUID string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(cdUID))
+	return rand.SafeEncodeString(fmt.Sprint(h.Sum32()))
+}
+
+// dnsNameFormat returns this manager's per-domain DNS name format string,
+// e.g. "compute-domain-daemon-bcs2h4gtp8-%04d".
+func (m *DNSNameManager) dnsNameFormat() string {
+	return dnsNamePrefix + m.domainHash + "-%04d"
 }
 
 // UpdateDNSNameMappings updates the /etc/hosts file with any new IP to DNS name
@@ -66,39 +98,60 @@ func (m *DNSNameManager) UpdateDNSNameMappings(daemons []*nvapi.ComputeDomainDae
 	m.Lock()
 	defer m.Unlock()
 
-	// Make a local ipToDNSName mappings
-	ipToDNSName := make(IPToDNSNameMap)
-
-	// Prefilter daemons to only consider those with the matching cliqueID
-	var cliqueDaemons []*nvapi.ComputeDomainDaemonInfo
-	for _, daemon := range daemons {
-		if daemon.CliqueID == m.cliqueID {
-			cliqueDaemons = append(cliqueDaemons, daemon)
-		}
+	mappings, err := m.buildDNSNameMappings(daemons)
+	if err != nil {
+		return false, err
 	}
 
-	// Add IPs to map
-	for _, daemon := range cliqueDaemons {
-		// Construct the DNS name from the daemon index
-		dnsName, err := m.constructDNSName(daemon)
-		if err != nil {
-			return false, fmt.Errorf("failed to allocate DNS name for IP %s: %w", daemon.IPAddress, err)
-		}
-
-		// Assign the IP -> DNS name mapping
-		ipToDNSName[daemon.IPAddress] = dnsName
-	}
-
-	// If the existing ipToDNSName mappings are unchanged, exit early
-	if maps.Equal(ipToDNSName, m.ipToDNSName) {
+	// If the existing mappings are unchanged, exit early
+	if slices.Equal(mappings, m.mappings) {
 		return false, nil
 	}
 
-	// Otherwise, update the cached ipToDNSName mapping
-	m.ipToDNSName = ipToDNSName
+	// Otherwise, update the cached mappings
+	m.mappings = mappings
 
 	// And update the hosts file with the new mapping
 	return true, m.updateHostsFile()
+}
+
+// buildDNSNameMappings builds one dnsNameMapping per maxNodesPerIMEXDomain
+// slot, in index order: a slot with a registered daemon in this clique maps
+// its DNS name to that daemon's pod IP, and every other slot maps to
+// sentinelIPAddress.
+func (m *DNSNameManager) buildDNSNameMappings(daemons []*nvapi.ComputeDomainDaemonInfo) ([]dnsNameMapping, error) {
+	// Index live daemons in this clique by their slot index.
+	byIndex := make(map[int]*nvapi.ComputeDomainDaemonInfo)
+	for _, daemon := range daemons {
+		if daemon.CliqueID != m.cliqueID {
+			continue
+		}
+		if daemon.Index < 0 || daemon.Index >= m.maxNodesPerIMEXDomain {
+			return nil, fmt.Errorf("daemon %s has invalid index %d, must be in [0, %d)", daemon.NodeName, daemon.Index, m.maxNodesPerIMEXDomain)
+		}
+		if existing, exists := byIndex[daemon.Index]; exists {
+			return nil, fmt.Errorf("multiple daemons registered at index %d in clique %q (%s and %s)", daemon.Index, m.cliqueID, existing.NodeName, daemon.NodeName)
+		}
+		byIndex[daemon.Index] = daemon
+	}
+
+	// Use this manager's own per-domain (hash-scoped) name format for every
+	// slot, so nodes.cfg (WriteNodesConfig) and /etc/hosts (this function)
+	// can never disagree on what a given slot's DNS name is.
+	format := m.dnsNameFormat()
+	mappings := make([]dnsNameMapping, m.maxNodesPerIMEXDomain)
+	for i := 0; i < m.maxNodesPerIMEXDomain; i++ {
+		ip := sentinelIPAddress
+		if daemon, ok := byIndex[i]; ok {
+			ip = daemon.IPAddress
+		}
+		mappings[i] = dnsNameMapping{
+			dnsName: fmt.Sprintf(format, i),
+			ip:      ip,
+		}
+	}
+
+	return mappings, nil
 }
 
 // LogDNSNameMappings logs the current compute-domain-daemon mappings from memory.
@@ -106,39 +159,16 @@ func (m *DNSNameManager) LogDNSNameMappings() {
 	m.Lock()
 	defer m.Unlock()
 
-	if len(m.ipToDNSName) == 0 {
-		klog.Infof("Current compute-domain-daemon mappings: empty")
+	if len(m.mappings) == 0 {
+		klog.V(2).Infof("Current compute-domain-daemon mappings: empty")
 		return
 	}
 
-	// Sort alphabetically by DNS name (map value) -> sort ips (map keys) based
-	// on their corresponding values.
-	var ips []string
-	for ip := range m.ipToDNSName {
-		ips = append(ips, ip)
+	// Already in ascending index order from buildDNSNameMappings, which for
+	// the zero-padded per-domain DNS name format is also ascending DNS-name order.
+	for _, mapping := range m.mappings {
+		klog.V(2).Infof("%s -> %s", mapping.dnsName, mapping.ip)
 	}
-
-	slices.SortFunc(ips, func(a, b string) int {
-		return cmp.Compare(m.ipToDNSName[a], m.ipToDNSName[b])
-	})
-
-	for _, ip := range ips {
-		dnsname := m.ipToDNSName[ip]
-		klog.Infof("%s -> %s", dnsname, ip)
-	}
-}
-
-// constructDNSName constructs a DNS name for a daemon based on its index field.
-// Returns an error if the index is invalid or exceeds maxNodesPerIMEXDomain.
-func (m *DNSNameManager) constructDNSName(daemon *nvapi.ComputeDomainDaemonInfo) (string, error) {
-	if daemon.Index < 0 {
-		return "", fmt.Errorf("daemon %s has invalid index %d", daemon.NodeName, daemon.Index)
-	}
-	if daemon.Index >= m.maxNodesPerIMEXDomain {
-		return "", fmt.Errorf("daemon %s has invalid index %d, must be less than %d", daemon.NodeName, daemon.Index, m.maxNodesPerIMEXDomain)
-	}
-	dnsName := fmt.Sprintf(dnsNameFormat, daemon.Index)
-	return dnsName, nil
 }
 
 // updateHostsFile updates the /etc/hosts file with current IP to DNS name mappings.
@@ -170,13 +200,12 @@ func (m *DNSNameManager) updateHostsFile() error {
 		newHostsContent.WriteString("\n")
 	}
 
-	// Add a separator comment
-	// TODO: do not write this more than once :-).
-	newHostsContent.WriteString("# Compute Domain Daemon mappings\n")
-
-	// Add new DNS name mappings
-	for ip, dnsName := range m.ipToDNSName {
-		_, _ = fmt.Fprintf(&newHostsContent, "%s\t%s\n", ip, dnsName)
+	// Add new DNS name mappings. Every maxNodesPerIMEXDomain slot gets an
+	// entry: occupied slots resolve to their daemon's real IP, the rest
+	// resolve to sentinelIPAddress so every name IMEX may try to resolve
+	// is always satisfied locally.
+	for _, mapping := range m.mappings {
+		_, _ = fmt.Fprintf(&newHostsContent, "%s\t%s\n", mapping.ip, mapping.dnsName)
 	}
 
 	// Write the updated hosts file
@@ -203,14 +232,15 @@ func (m *DNSNameManager) WriteNodesConfig() error {
 	defer f.Close()
 
 	// Write static DNS names
+	format := m.dnsNameFormat()
 	for i := 0; i < m.maxNodesPerIMEXDomain; i++ {
-		dnsName := fmt.Sprintf(dnsNameFormat, i)
+		dnsName := fmt.Sprintf(format, i)
 		if _, err := fmt.Fprintf(f, "%s\n", dnsName); err != nil {
 			return fmt.Errorf("failed to write to nodes config file: %w", err)
 		}
 	}
 
-	klog.Infof("Created static nodes config file with %d DNS names using format %s", m.maxNodesPerIMEXDomain, dnsNameFormat)
+	klog.Infof("Created static nodes config file with %d DNS names using format %s", m.maxNodesPerIMEXDomain, format)
 
 	return nil
 }

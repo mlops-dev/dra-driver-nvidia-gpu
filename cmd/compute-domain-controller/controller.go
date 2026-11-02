@@ -47,6 +47,11 @@ type ManagerConfig struct {
 	// imexConfig holds the resolved imex.mode / imex.isolation configuration.
 	imexConfig imex.Config
 
+	// imexConfigOverrides holds arbitrary nvidia-imex daemon config file
+	// overrides (resources.computeDomains.imex.config Helm value), passed
+	// through to dynamically rendered compute-domain-daemon DaemonSets.
+	imexConfigOverrides map[string]string
+
 	// clientsets provides access to various Kubernetes API client interfaces
 	clientsets flags.ClientSets
 
@@ -70,6 +75,9 @@ type ManagerConfig struct {
 
 	// imagePullSecretNames are the names of the image pull secrets to apply to dynamically rendered compute-domain-daemon
 	imagePullSecretNames []string
+
+	// cdDaemonPriorityClassName is the priority class for dynamically rendered compute-domain-daemon.
+	cdDaemonPriorityClassName string
 }
 
 // Controller manages the lifecycle of the DRA driver and its components.
@@ -90,18 +98,20 @@ func (c *Controller) Run(ctx context.Context) error {
 	workQueue := workqueue.New(workqueue.DefaultControllerRateLimiter())
 
 	managerConfig := &ManagerConfig{
-		driverName:            c.config.driverName,
-		driverNamespace:       c.config.flags.namespace,
-		additionalNamespaces:  c.config.flags.additionalNamespaces.Value(),
-		imageName:             c.config.flags.imageName,
-		maxNodesPerIMEXDomain: c.config.flags.maxNodesPerIMEXDomain,
-		imexConfig:            c.config.imexConfig,
-		clientsets:            c.config.clientsets,
-		workQueue:             workQueue,
-		logVerbosityCDDaemon:  c.config.flags.logVerbosityCDDaemon,
-		httpEndpoint:          c.config.flags.httpEndpoint,
-		metricsPath:           c.config.flags.metricsPath,
-		imagePullSecretNames:  c.config.imagePullSecretNames,
+		driverName:                c.config.driverName,
+		driverNamespace:           c.config.flags.namespace,
+		additionalNamespaces:      c.config.flags.additionalNamespaces.Value(),
+		imageName:                 c.config.flags.imageName,
+		maxNodesPerIMEXDomain:     c.config.flags.maxNodesPerIMEXDomain,
+		imexConfig:                c.config.imexConfig,
+		imexConfigOverrides:       c.config.imexConfigOverrides,
+		clientsets:                c.config.clientsets,
+		workQueue:                 workQueue,
+		logVerbosityCDDaemon:      c.config.flags.logVerbosityCDDaemon,
+		httpEndpoint:              c.config.flags.httpEndpoint,
+		metricsPath:               c.config.flags.metricsPath,
+		imagePullSecretNames:      c.config.imagePullSecretNames,
+		cdDaemonPriorityClassName: c.config.cdDaemonPriorityClassName,
 	}
 
 	// TODO: log full, nested cliFlags structure.

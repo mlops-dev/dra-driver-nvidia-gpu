@@ -44,6 +44,17 @@ Disable a plugin you do not need with no impact on the other:
 
 When GPU allocation is enabled, the chart also creates DeviceClass resources for full GPUs, MIG slices, and VFIO passthrough. Individual device types still require the appropriate hardware and [feature gates](feature-gates/).
 
+## ComputeDomain IMEX
+
+| Value | Default | Description |
+|---|---|---|
+| `resources.computeDomains.imex.mode` | `driverManaged` | Selects who manages the `nvidia-imex` daemon lifecycle: `driverManaged` creates a per-ComputeDomain daemon DaemonSet, while `hostManaged` uses a host service that you manage and requires the [`HostManagedIMEXDaemon`](feature-gates.md) feature gate. |
+| `resources.computeDomains.imex.isolation` | `domain` | Selects IMEX isolation, where `domain` shares channel 0 among workloads in the same IMEX domain and `channel` is reserved but unsupported. |
+| `resources.computeDomains.imex.hostSocketPath` | `/etc/nvidia-imex/imex_ctrl.sock` | Sets the path under `nvidiaDriverRoot` to the host IMEX command socket that the ComputeDomain kubelet plugin queries for a `READY` response during claim preparation in `hostManaged` mode. |
+| `resources.computeDomains.imex.config` | `{}` | A map of arbitrary `nvidia-imex` daemon config file setting names to values, overriding or adding to the defaults rendered by dynamically launched compute-domain-daemon pods. Only applies in `driverManaged` mode; ignored in `hostManaged` mode. See [NVIDIA's IMEX documentation](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/) for the full list of settings. |
+
+Drain ComputeDomain workload pods and delete existing `ComputeDomain` resources before you change `resources.computeDomains.imex.mode` or `resources.computeDomains.imex.isolation`.
+
 ## Kubernetes API version
 
 | Value | Default | Description |
@@ -118,7 +129,7 @@ Deployed when `resources.computeDomains.enabled=true`.
 | `controller.metrics.enabled` | `true` | Expose Prometheus metrics on the controller pod. |
 | `controller.metrics.httpEndpoint` | `:8080` | Metrics listen address. |
 | `controller.metrics.profilePath` | `""` | Optional pprof profile path. Empty disables profiling. |
-| `controller.priorityClassName` | `system-node-critical` | Priority class for the controller pod. |
+| `controller.priorityClassName` | `system-node-critical` | Priority class for the controller pod. Also applied to dynamically rendered `compute-domain-daemon` DaemonSet pods. |
 | `controller.networkPolicy.enabled` | `false` | Create a NetworkPolicy for the controller. |
 
 The controller schedules onto control-plane nodes by default (`nodeSelector`, `tolerations`, and `affinity` are configurable). Additional `controller.*` values set pod annotations, security contexts, and container resource limits.

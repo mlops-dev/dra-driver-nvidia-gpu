@@ -734,6 +734,9 @@ func (s *DeviceState) rollbackPartiallyPreparedMIGDevices(ctx context.Context, c
 	}
 
 	for _, r := range pc.Status.Allocation.Devices.Results {
+		if r.Driver != DriverName {
+			continue
+		}
 		devname := r.Device
 		ms, err := NewMigSpecTupleFromCanonicalName(devname)
 		if err != nil {
@@ -1465,7 +1468,7 @@ func (s *DeviceState) gpuInfosFromPreparedClaim(results []resourceapi.DeviceRequ
 		}
 		device := s.perGPUAllocatable.GetAllocatableDevice(r.Device)
 		if device == nil {
-			klog.V(6).Infof("allocatable not found for device %q", r.Device)
+			klog.Warningf("allocatable not found for device %q", r.Device)
 			continue
 		}
 		switch device.Type() {
