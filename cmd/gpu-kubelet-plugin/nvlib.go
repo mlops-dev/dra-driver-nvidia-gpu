@@ -18,6 +18,7 @@ package main
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -433,16 +434,24 @@ func (l deviceLib) discoverVfioDevice(gpuInfo *GpuInfo) (*AllocatableDevice, err
 // Tear down any MIG devices that are present and don't belong to completed
 // claims. This can be improved for tearing down partial state (GI without CI,
 // for example).
+//
+// Failures are collected per GPU (and per MIG device) instead of aborting the
+// walk: one MIG device that is still "in use by another client" must not leave
+// every later GPU uncleaned. This also runs periodically, so anything that
+// failed here is retried on the next pass.
 func (l deviceLib) obliterateStaleMIGDevices(expectedDeviceNames []DeviceName) error {
+	var errs []error
 	err := l.VisitDevices(func(i int, d nvdev.Device) error {
 		ginfo, err := l.getGpuInfo(i, d)
 		if err != nil {
-			return fmt.Errorf("error getting info for GPU %d: %w", i, err)
+			errs = append(errs, fmt.Errorf("error getting info for GPU %d: %w", i, err))
+			return nil
 		}
 
 		migs, err := l.getMigDevices(ginfo)
 		if err != nil {
-			return fmt.Errorf("error getting MIG devices for GPU %d: %w", i, err)
+			errs = append(errs, fmt.Errorf("error getting MIG devices for GPU %d: %w", i, err))
+			return nil
 		}
 
 		for _, mdi := range migs {
@@ -451,7 +460,7 @@ func (l deviceLib) obliterateStaleMIGDevices(expectedDeviceNames []DeviceName) e
 			if !expected {
 				klog.Warningf("Found unexpected MIG device (%s), attempt to tear down", name)
 				if err := l.deleteMigDevice(mdi.LiveTuple()); err != nil {
-					return fmt.Errorf("could not delete unexpected MIG device (%s): %w", name, err)
+					errs = append(errs, fmt.Errorf("could not delete unexpected MIG device (%s): %w", name, err))
 				}
 			}
 		}
@@ -459,15 +468,14 @@ func (l deviceLib) obliterateStaleMIGDevices(expectedDeviceNames []DeviceName) e
 		// If no MIG device was found on this GPU, MIG mode might still be
 		// enabled. Disable it in this case.
 		if err := l.maybeDisableMigMode(ginfo.UUID, d); err != nil {
-			return fmt.Errorf("maybeDisableMigMode failed for GPU %s: %w", ginfo.UUID, err)
+			errs = append(errs, fmt.Errorf("maybeDisableMigMode failed for GPU %s: %w", ginfo.UUID, err))
 		}
 		return nil
 	})
-
 	if err != nil {
-		return fmt.Errorf("error visiting devices: %w", err)
+		errs = append(errs, fmt.Errorf("error visiting devices: %w", err))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (l deviceLib) getGpuInfo(index int, device nvdev.Device) (*GpuInfo, error) {
@@ -1313,13 +1321,29 @@ func (l deviceLib) maybeDisableMigMode(uuid string, nvmldev nvml.Device) error {
 		return fmt.Errorf("uuid not in gpuInfosByUUID: %s", uuid)
 	}
 
-	migs, err := l.getMigDevices(gpu)
-	if err != nil {
-		return fmt.Errorf("error getting MIG devices for %s: %w", gpu.String(), err)
+	// Read MIG state from the device itself, not from gpu.migEnabled: that flag
+	// is captured at plugin startup and is not updated when DynamicMIG later
+	// enables MIG mode, so on a GPU that started with MIG disabled it hides live
+	// MIG devices and would lead to disabling MIG under a running workload.
+	current, pending, ret := nvmldev.GetMigMode()
+	if ret == nvml.ERROR_NOT_SUPPORTED {
+		return nil
+	}
+	if ret == nvml.SUCCESS && current == nvml.DEVICE_MIG_DISABLE && pending == nvml.DEVICE_MIG_DISABLE {
+		// Already disabled; skip the mode change (this runs periodically).
+		return nil
 	}
 
-	if len(migs) > 0 {
-		klog.V(6).Infof("Leaving MIG mode enabled for device %s (currently present MIG devices: %d)", gpu.String(), len(migs))
+	liveMigs := 0
+	if err := walkMigDevices(nvmldev, func(int, nvml.Device) error {
+		liveMigs++
+		return nil
+	}); err != nil {
+		return fmt.Errorf("error counting MIG devices for %s: %w", gpu.String(), err)
+	}
+
+	if liveMigs > 0 {
+		klog.V(6).Infof("Leaving MIG mode enabled for device %s (currently present MIG devices: %d)", gpu.String(), liveMigs)
 		return nil
 	}
 

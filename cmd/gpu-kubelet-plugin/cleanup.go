@@ -37,6 +37,11 @@ const (
 
 type TypeUnprepCallable = func(ctx context.Context, claimRef kubeletplugin.NamespacedObject) error
 
+// TypeReconcileCallable reclaims device state (MPS daemons, compute mode, MIG
+// devices) left behind without an owning claim. Provided by the driver so it
+// can run under the same prepare/unprepare file lock as Prepare and Unprepare.
+type TypeReconcileCallable = func(ctx context.Context)
+
 type CheckpointCleanupManager struct {
 	waitGroup     sync.WaitGroup
 	cancelContext context.CancelFunc
@@ -44,7 +49,8 @@ type CheckpointCleanupManager struct {
 	devicestate   *DeviceState
 	draclient     *draclient.Client
 
-	unprepfunc TypeUnprepCallable
+	unprepfunc    TypeUnprepCallable
+	reconcilefunc TypeReconcileCallable
 }
 
 func NewCheckpointCleanupManager(s *DeviceState, client *draclient.Client) *CheckpointCleanupManager {
@@ -58,10 +64,11 @@ func NewCheckpointCleanupManager(s *DeviceState, client *draclient.Client) *Chec
 	}
 }
 
-func (m *CheckpointCleanupManager) Start(ctx context.Context, unprepfunc TypeUnprepCallable) error {
+func (m *CheckpointCleanupManager) Start(ctx context.Context, unprepfunc TypeUnprepCallable, reconcilefunc TypeReconcileCallable) error {
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelContext = cancel
 	m.unprepfunc = unprepfunc
+	m.reconcilefunc = reconcilefunc
 
 	m.waitGroup.Add(1)
 	go func() {
@@ -128,11 +135,13 @@ func (m *CheckpointCleanupManager) cleanup(ctx context.Context) {
 		m.unprepareIfStale(ctx, cpuid, cpclaim)
 	}
 
-	// Recover GPUs stuck in EXCLUSIVE_PROCESS after a crash/reboot prevented MPS
-	// teardown from resetting compute mode. Runs on the same startup+periodic
-	// cadence as the stale-claim cleanup above: startup handles pre-existing
-	// orphans, the periodic pass catches ones created while running.
-	m.devicestate.reconcileOrphanedComputeModes(ctx)
+	// Reclaim MPS daemons / compute mode and MIG devices left without an owning
+	// claim (crash, reboot, or a skipped/failed teardown). Runs on the same
+	// startup+periodic cadence as the stale-claim cleanup above: startup handles
+	// pre-existing orphans, the periodic pass catches ones created while running.
+	if m.reconcilefunc != nil {
+		m.reconcilefunc(ctx)
+	}
 }
 
 // Detect if claim is stale (not known to the API server). Call unprepare() if

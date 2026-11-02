@@ -73,6 +73,17 @@ type fakeNVMLGPU struct {
 	giProfile       nvml.GpuInstanceProfileInfo
 	setMigModeCalls []int
 	events          *[]string
+	// migModeDisabled reports MIG mode as disabled (current and pending).
+	// The zero value reports it enabled, which is the state every MIG
+	// create/delete path in these tests operates in.
+	migModeDisabled bool
+}
+
+func (d *fakeNVMLGPU) GetMigMode() (int, int, nvml.Return) {
+	if d.migModeDisabled {
+		return nvml.DEVICE_MIG_DISABLE, nvml.DEVICE_MIG_DISABLE, nvml.SUCCESS
+	}
+	return nvml.DEVICE_MIG_ENABLE, nvml.DEVICE_MIG_ENABLE, nvml.SUCCESS
 }
 
 func (*fakeNVMLGPU) GetMaxMigDeviceCount() (int, nvml.Return) {
@@ -81,6 +92,10 @@ func (*fakeNVMLGPU) GetMaxMigDeviceCount() (int, nvml.Return) {
 
 func (d *fakeNVMLGPU) GetMigDeviceHandleByIndex(int) (nvml.Device, nvml.Return) {
 	if d.migDevice == nil {
+		return nil, nvml.ERROR_NOT_FOUND
+	}
+	// As in NVML, a MIG device disappears once its GPU instance is destroyed.
+	if gi, ok := d.gi.(*fakeNVMLGpuInstance); ok && gi.destroyed {
 		return nil, nvml.ERROR_NOT_FOUND
 	}
 	return d.migDevice, nvml.SUCCESS
@@ -122,6 +137,7 @@ type fakeNVMLGpuInstance struct {
 	createComputeInstanceRet nvml.Return
 	getComputeInstanceRet    nvml.Return
 	events                   *[]string
+	destroyed                bool
 }
 
 func (g *fakeNVMLGpuInstance) GetInfo() (nvml.GpuInstanceInfo, nvml.Return) {
@@ -148,6 +164,7 @@ func (g *fakeNVMLGpuInstance) CreateComputeInstance(profile *nvml.ComputeInstanc
 }
 
 func (g *fakeNVMLGpuInstance) Destroy() nvml.Return {
+	g.destroyed = true
 	if g.events != nil {
 		*g.events = append(*g.events, "destroy-gi")
 	}
@@ -400,6 +417,53 @@ func TestDeviceLibDeleteMigDevice(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"destroy-ci", "destroy-gi", "set-mig-mode"}, events)
 	require.Equal(t, []int{nvml.DEVICE_MIG_DISABLE}, gpu.setMigModeCalls)
+}
+
+func TestDeviceLibMaybeDisableMigMode(t *testing.T) {
+	enableDynamicMIGForTest(t)
+
+	tests := []struct {
+		name            string
+		migModeDisabled bool
+		liveMigDevice   bool
+		wantSetMigMode  []int
+	}{
+		{
+			// No MIG device left and MIG mode on: give the full GPU back.
+			name:           "enabled with no MIG devices is disabled",
+			wantSetMigMode: []int{nvml.DEVICE_MIG_DISABLE},
+		},
+		{
+			// The cached GpuInfo below has migEnabled=false (MIG was off at
+			// plugin startup). The live device still has a MIG device, so MIG
+			// mode must be left alone.
+			name:           "live MIG device keeps MIG mode despite stale cached flag",
+			liveMigDevice:  true,
+			wantSetMigMode: nil,
+		},
+		{
+			// Periodic runs must not issue a mode change on GPUs already off.
+			name:            "already disabled is a no-op",
+			migModeDisabled: true,
+			wantSetMigMode:  nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gpu := &fakeNVMLGPU{migModeDisabled: tc.migModeDisabled}
+			if tc.liveMigDevice {
+				gpu.migDevice = &fakeNVMLMigDevice{giID: 1, ciID: 0}
+			}
+			parent := &GpuInfo{UUID: "GPU-1", minor: 1, migEnabled: false}
+			l := deviceLib{
+				devhandleByUUID: map[string]nvml.Device{parent.UUID: gpu},
+				gpuInfosByUUID:  map[string]*GpuInfo{parent.UUID: parent},
+			}
+
+			require.NoError(t, l.maybeDisableMigMode(parent.UUID, gpu))
+			require.Equal(t, tc.wantSetMigMode, gpu.setMigModeCalls)
+		})
+	}
 }
 
 func withoutMigDeviceRuntimeFields(info *MigDeviceInfo) *MigDeviceInfo {

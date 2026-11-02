@@ -406,18 +406,15 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 // It tries to tear down any existing MIG device that is not referenced by
 // currently checkpointed claims in ClaimCheckpointStatePrepareCompleted state.
 //
-// This routine is currently called once during startup before accepting
-// requests from the kubelet. TODO: a better mechanism to make sure it does not
-// conflict with overlapping Prepare() and Unprepare() activities (from e.g. a
-// separate plugin process, during an upgrade) would be to hold on to file-based
-// lock on the checkpoint (during the entire operation). Notworthy: the
-// operation may potentially take significant wall time.
+// This routine is called once during startup before accepting requests from
+// the kubelet, and then periodically via reconcileOrphanedMIGDevices(). The
+// periodic caller holds the prepare/unprepare file lock and the DeviceState
+// lock, so it cannot overlap a Prepare() or Unprepare() in this or another
+// plugin process (e.g. during an upgrade). Notworthy: the operation may
+// potentially take significant wall time.
 //
 // We need to learn over time how workload running on a to-be-torn-down MIG
 // device may and should affect the teardown attempt.
-//
-// There may be a fundamental need to invoke this type of cleanup periodically,
-// instead of once during startup.
 //
 // Note: there are other cleanup strategies performed at runtime: (1) periodic
 // cleanup of partially prepared but _stale_ claims (2) attempted rollback in
@@ -488,6 +485,28 @@ func (s *DeviceState) DestroyUnknownMIGDevices(ctx context.Context) {
 	}
 
 	klog.Infof("%s: done", logpfx)
+}
+
+// reconcileOrphanedMIGDevices reclaims MIG devices left behind at runtime
+// without waiting for a plugin restart. A MIG device whose teardown was skipped
+// or failed during Unprepare() keeps its GPU instance allocated (later claims
+// for that placement fail with "Insufficient Resources") and keeps MIG mode
+// enabled (the full GPU stays unusable); startup cleanup alone only recovers
+// these on the next restart.
+//
+// The caller must hold the prepare/unprepare file lock; this method takes the
+// DeviceState lock. Together they guarantee no Prepare() is between creating a
+// MIG device and recording it as PrepareCompleted, which is the state that
+// DestroyUnknownMIGDevices() would otherwise mistake for an unknown device.
+func (s *DeviceState) reconcileOrphanedMIGDevices(ctx context.Context) {
+	if !featuregates.Enabled(featuregates.DynamicMIG) || !s.IsMigCapable() {
+		return
+	}
+
+	s.Lock()
+	defer s.Unlock()
+
+	s.DestroyUnknownMIGDevices(ctx)
 }
 
 func (s *DeviceState) Unprepare(ctx context.Context, claimRef kubeletplugin.NamespacedObject) error {

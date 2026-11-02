@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # Match the toolchain the project builds with (see deployments/devel/Dockerfile).
-GO_IMAGE="${GO_IMAGE:-golang:1.26}"
+GO_IMAGE="${GO_IMAGE:-golang:1.27}"
 
 # Default target: the package these changes touch. Override by passing args.
 if [[ $# -eq 0 ]]; then

@@ -178,8 +178,8 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		}()
 	}
 
-	// Pass `nodeUnprepareResource` function to the cleanup manager.
-	if err := state.checkpointCleanupManager.Start(ctx, driver.nodeUnprepareResource); err != nil {
+	// Pass `nodeUnprepareResource` and the orphan reconcile to the cleanup manager.
+	if err := state.checkpointCleanupManager.Start(ctx, driver.nodeUnprepareResource, driver.reconcileOrphanedDeviceState); err != nil {
 		return nil, fmt.Errorf("error starting CheckpointCleanupManager: %w", err)
 	}
 
@@ -468,6 +468,23 @@ func (d *driver) nodeUnprepareResource(ctx context.Context, claimRef kubeletplug
 
 	drametrics.ObserveRequest(DriverName, "unprepare", time.Since(t0))
 	return nil
+}
+
+// reconcileOrphanedDeviceState reclaims MPS daemons / compute mode and MIG
+// devices that no claim owns any more. It holds the prepare/unprepare file lock
+// so it cannot interleave with a Prepare or Unprepare in this or another plugin
+// process (two plugin pods can briefly overlap on a node during an upgrade).
+// If the lock is busy the pass is skipped; the next periodic run retries.
+func (d *driver) reconcileOrphanedDeviceState(ctx context.Context) {
+	release, err := d.pulock.Acquire(ctx, flock.WithTimeout(10*time.Second))
+	if err != nil {
+		klog.Warningf("Orphan reconcile: skipped, could not acquire prep/unprep lock (retried next run): %s", err)
+		return
+	}
+	defer release()
+
+	d.state.reconcileOrphanedComputeModes(ctx)
+	d.state.reconcileOrphanedMIGDevices(ctx)
 }
 
 func (d *driver) publishResources(ctx context.Context, config *Config) error {
